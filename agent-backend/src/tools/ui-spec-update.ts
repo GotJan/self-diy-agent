@@ -1,0 +1,151 @@
+/**
+ * update_ui_spec —— 修改已有的 UI spec 组件
+ *
+ * 可更新 spec 的 displayName、description 或整个 jsonContent。
+ */
+
+import { tool } from '@langchain/core/tools';
+import { z } from 'zod';
+import fs from 'fs';
+import path from 'path';
+import { SPECS_DIR, sanitizeName, extractDataSchema } from './utils.js';
+import { notifySpecChanged } from './events.js';
+
+const ALLOWED_COMPONENTS = [
+  'Stack', 'Card', 'Heading', 'Text', 'Input', 'Button', 'Select',
+  'Switch', 'Separator', 'List', 'ListItem', 'Image', 'CodeBlock',
+  'Markdown', 'Link', 'Badge', 'Table',
+];
+
+export const updateUiSpecTool = tool(
+  ({ name, displayName, description, jsonContent, actions, initialState }) => {
+    const safeName = sanitizeName(name);
+    const filePath = path.join(SPECS_DIR, `${safeName}.json`);
+
+    if (!fs.existsSync(filePath)) {
+      return { success: false, error: `UI spec '${safeName}' 不存在。请用 create_ui_spec 创建。` };
+    }
+
+    // 读取现有 spec
+    let existing: any;
+    try {
+      existing = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    } catch {
+      return { success: false, error: `无法解析现有 spec 文件 '${safeName}.json'` };
+    }
+
+    // 更新元数据
+    if (displayName !== undefined) existing.displayName = displayName;
+    if (description !== undefined) existing.description = description;
+
+    // 解析 actions / initialState（独立于 jsonContent）
+    if (actions !== undefined && actions !== '') {
+      let parsed: any;
+      try {
+        parsed = typeof actions === 'string' ? JSON.parse(actions) : actions;
+        existing.data = existing.data || {};
+        existing.data.actions = parsed;
+      } catch { return { success: false, error: 'actions 不是有效的 JSON 字符串' }; }
+    }
+    if (initialState !== undefined && initialState !== '') {
+      let parsed: any;
+      try {
+        parsed = typeof initialState === 'string' ? JSON.parse(initialState) : initialState;
+        existing.data = existing.data || {};
+        existing.data.initialState = parsed;
+      } catch { return { success: false, error: 'initialState 不是有效的 JSON 字符串' }; }
+    }
+
+    // 更新 jsonContent
+    if (jsonContent !== undefined && jsonContent !== '') {
+      let parsed: any;
+      try {
+        parsed = typeof jsonContent === 'string' ? JSON.parse(jsonContent) : jsonContent;
+      } catch {
+        return { success: false, error: 'jsonContent 不是有效的 JSON 字符串' };
+      }
+
+      // 提取 data 层
+      const specData = parsed.data || parsed;
+      if (!parsed.data && !parsed.root && !parsed.elements) {
+        return {
+          success: false,
+          error: 'jsonContent 格式错误。推荐: { "data": { "root": "xxx", "elements": {...} } }。也可兼容旧格式。',
+        };
+      }
+
+      // 检查结构
+      if (!specData.root && !specData.elements) {
+        return {
+          success: false,
+          error: 'data 中缺少 root 或 elements 字段',
+        };
+      }
+
+      // 校验组件类型
+      if (specData.elements) {
+        const invalidTypes: string[] = [];
+        for (const [id, el] of Object.entries(specData.elements) as [string, any][]) {
+          if (el.type && !ALLOWED_COMPONENTS.includes(el.type)) {
+            invalidTypes.push(`${id}: "${el.type}"`);
+          }
+        }
+        if (invalidTypes.length > 0) {
+          return {
+            success: false,
+            error: `以下组件类型不在白名单内: ${invalidTypes.join(', ')}。请先调用 get_ui_spec_rules 查看可用组件。`,
+            allowedComponents: ALLOWED_COMPONENTS,
+          };
+        }
+      }
+
+      // 合并到现有 spec 的 data 层
+      existing.data = {
+        ...existing.data,
+        root: specData.root,
+        elements: specData.elements,
+      };
+      if (specData.initialData) existing.data.initialData = specData.initialData;
+    }
+
+    existing._updated = new Date().toISOString();
+    fs.writeFileSync(filePath, JSON.stringify(existing, null, 2), 'utf-8');
+    notifySpecChanged();
+
+    const data = existing.data || { root: existing.root, elements: existing.elements };
+    return {
+      success: true,
+      name: safeName,
+      displayName: existing.displayName || safeName,
+      elementCount: data.elements ? Object.keys(data.elements).length : 0,
+      dataSchema: extractDataSchema(data.elements),
+      message: `UI spec '${safeName}' 更新成功。`,
+      updatedFields: [
+        displayName !== undefined ? 'displayName' : null,
+        description !== undefined ? 'description' : null,
+        jsonContent !== undefined ? 'jsonContent' : null,
+      ].filter(Boolean),
+    };
+  },
+  {
+    name: 'update_ui_spec',
+    description:
+      '修改已有的 UI spec 组件。可更新 displayName、description、jsonContent、actions 和 initialState。\n' +
+      '⚠️ 调用前必须先调 get_ui_data 查看组件的 dataSchema 和 data，了解现有结构后再修改。\n' +
+      '只传需要修改的字段，不传的字段保持不变。',
+    schema: z.object({
+      name: z.string().describe('要修改的 spec 名称（不含 .json 后缀）'),
+      displayName: z.string().optional().describe('新的展示名称'),
+      description: z.string().optional().describe('新的用途描述'),
+      jsonContent: z.string().optional().describe(
+        '新的 JSON 内容，格式: { "data": { "root": "根元素ID", "elements": {...} } }。不传则保留原有内容。'
+      ),
+      actions: z.string().optional().describe(
+        'JSON 字符串，更新按钮交互行为。格式: { "submit": { "type": "url"|"fetch", ... } }'
+      ),
+      initialState: z.string().optional().describe(
+        'JSON 字符串，更新表单初始值。格式: { "form": { "keyword": "" } }'
+      ),
+    }),
+  }
+);

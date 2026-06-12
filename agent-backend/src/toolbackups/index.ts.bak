@@ -1,0 +1,84 @@
+/**
+ * 工具入口：启动时自动扫描 tools 目录，加载所有工具。
+ *
+ * 新增工具只需在 tools/ 下放一个 .ts 文件，无需手动 import 或重启：
+ *   - 静态：放文件后重启自动加载
+ *   - 动态：通过 create_tool 运行时注册，即时生效（文件也会落盘，下次重启自动加载）
+ */
+
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { registerTool, getTools } from './registry.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * 运行时 enabled 工具名缓存：从 DB 读取，每轮对话前刷新
+ */
+let enabledToolNames = new Set<string>();
+
+/**
+ * 即时添加工具到启用集（registerTool 时调用，避免等下一轮 DB 查询）
+ */
+export function markToolEnabled(name: string): void {
+  enabledToolNames.add(name);
+}
+
+/**
+ * 从 DB 的 tools 表读取启用的工具名列表
+ */
+export async function refreshEnabledToolSet(): Promise<void> {
+  try {
+    const { getDb } = await import('./sqlite-db.js');
+    const db = getDb();
+    const rows = db.prepare(`SELECT name FROM tools WHERE enabled = 1`).all() as { name: string }[];
+    const dbNames = new Set(rows.map((r) => r.name));
+    // 保留 markToolEnabled 添加但 DB 尚不可见的名字（WAL 延迟）
+    const manuallyAdded = new Set([...enabledToolNames].filter((n) => !dbNames.has(n)));
+    enabledToolNames = new Set([...dbNames, ...manuallyAdded]);
+  } catch {
+    // DB 未就绪时保留旧缓存
+  }
+}
+
+/**
+ * 获取当前启用的工具（过滤掉禁用的）
+ */
+export function getEnabledTools() {
+  const all = getTools();
+  return all.filter((t) => enabledToolNames.has(t.name));
+}
+
+/**
+ * 启动时自动扫描 tools 目录，加载所有 .ts 工具文件
+ */
+export async function autoLoadTools(): Promise<void> {
+  const files = fs.readdirSync(__dirname).filter(
+    (f) =>
+      (f.endsWith('.ts') || f.endsWith('.js')) &&
+      !f.endsWith('.d.ts') &&           // 跳过类型声明文件
+      !f.startsWith('index.') &&         // 跳过自身
+      !f.startsWith('registry.')         // 跳过注册表
+  );
+
+  for (const file of files) {
+    try {
+      const mod = await import(`./${file.replace(/\.(?:d\.)?ts$/, '.js')}`);
+      const exportedTool = Object.values(mod).find(
+        (v) => v && typeof v === 'object' && 'name' in (v as any) && 'func' in (v as any)
+      );
+      if (exportedTool) {
+        registerTool(exportedTool as any, file);
+      } else {
+        console.warn(`[AutoLoad] ${file}: no tool export found, skipping`);
+      }
+    } catch (err: any) {
+      console.error(`[AutoLoad] Failed to load ${file}:`, err.message);
+    }
+  }
+}
+
+// 重新导出注册表 API
+export { registerTool, unregisterTool, getTools } from './registry.js';
+export { setToolRegistryCallback } from './registry.js';

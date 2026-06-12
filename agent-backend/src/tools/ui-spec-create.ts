@@ -1,0 +1,161 @@
+/**
+ * create_ui_spec —— 动态创建新的 UI spec 组件
+ *
+ * 在前端 agent-backend/specs/ 目录下生成 .json 文件，LLM 可据此动态扩展 UI。
+ */
+
+import { tool } from '@langchain/core/tools';
+import { z } from 'zod';
+import fs from 'fs';
+import path from 'path';
+import { SPECS_DIR, sanitizeName, extractDataSchema } from './utils.js';
+import { notifySpecChanged } from './events.js';
+
+// 允许的组件类型白名单（与前端 catalog.ts 保持一致）
+const ALLOWED_COMPONENTS = [
+  'Stack', 'Card', 'Heading', 'Text', 'Input', 'Button', 'Select',
+  'Switch', 'Separator', 'List', 'ListItem', 'Image', 'CodeBlock',
+  'Markdown', 'Link', 'Badge', 'Table', 'FloatSprite',
+];
+
+export const createUiSpecTool = tool(
+  ({ name, displayName, description, jsonContent, actions, initialState }) => {
+    // 1. 检查同名
+    const safeName = sanitizeName(name);
+    const filePath = path.join(SPECS_DIR, `${safeName}.json`);
+
+    if (fs.existsSync(filePath)) {
+      let existingInfo = '';
+      try {
+        const existing = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+        const els = existing.data?.elements || existing.elements;
+        existingInfo = ` | 现有: displayName="${existing.displayName || '?'}", ${els ? Object.keys(els).length : 0} 个元素`;
+      } catch {}
+      return {
+        success: false,
+        error: `❌ 文件名冲突: UI spec '${safeName}' 已存在${existingInfo}。\n请选择以下方案之一：\n  1. 复用: 调用 update_ui_spec(name="${safeName}", ...) 修改现有 spec\n  2. 改名: 换一个文件名创建新的 spec`,
+        existingName: safeName,
+      };
+    }
+
+    // 2. 解析 actions / initialState
+    let parsedActions: any = undefined;
+    let parsedInitial = undefined;
+    if (actions) {
+      try {
+        parsedActions = typeof actions === 'string' ? JSON.parse(actions) : actions;
+      } catch { return { success: false, error: 'actions 不是有效的 JSON 字符串' }; }
+    }
+    if (initialState) {
+      try {
+        parsedInitial = typeof initialState === 'string' ? JSON.parse(initialState) : initialState;
+      } catch { return { success: false, error: 'initialState 不是有效的 JSON 字符串' }; }
+    }
+
+    // 3. 解析并校验 jsonContent：统一要求 { data: { root, elements } } 包裹
+    let parsed: any;
+    try {
+      if (typeof jsonContent === 'string') {
+        parsed = JSON.parse(jsonContent);
+      } else {
+        parsed = jsonContent;
+      }
+    } catch {
+      return { success: false, error: 'jsonContent 不是有效的 JSON 字符串' };
+    }
+
+    // 提取 data 层
+    const specData = parsed.data || parsed;
+    if (parsed.data) {
+      // 新格式：{ data: { root, elements } }
+    } else if (parsed.root || parsed.elements) {
+      // 兼容旧格式：直接传 { root, elements }
+    } else {
+      return {
+        success: false,
+        error: 'jsonContent 格式错误。新格式: { "data": { "root": "根元素ID", "elements": {...} } }。也可传旧格式: { "root": "...", "elements": {...} }',
+      };
+    }
+
+    // 校验 spec 结构
+    if (!specData.root && !specData.elements) {
+      return {
+        success: false,
+        error: 'data 中缺少 root 或 elements 字段，格式应为 { "data": { "root": "xxx", "elements": {...} } }',
+      };
+    }
+
+    // 4. 校验所有组件类型都在白名单内
+    if (specData.elements) {
+      const invalidTypes: string[] = [];
+      for (const [id, el] of Object.entries(specData.elements) as [string, any][]) {
+        if (el.type && !ALLOWED_COMPONENTS.includes(el.type)) {
+          invalidTypes.push(`${id}: "${el.type}"`);
+        }
+      }
+      if (invalidTypes.length > 0) {
+        return {
+          success: false,
+          error: `以下组件类型不在白名单内: ${invalidTypes.join(', ')}。请先调用 get_ui_spec_rules 查看可用组件。`,
+          allowedComponents: ALLOWED_COMPONENTS,
+        };
+      }
+    }
+
+    // 5. 确保目录存在并写入
+    if (!fs.existsSync(SPECS_DIR)) {
+      fs.mkdirSync(SPECS_DIR, { recursive: true });
+    }
+
+    // 合并 actions / initialState 到 data 层
+    if (parsedActions) specData.actions = parsedActions;
+    if (parsedInitial) specData.initialState = parsedInitial;
+
+    const specFile = {
+      displayName: displayName || safeName,
+      description: description || '',
+      data: specData,
+      _created: new Date().toISOString(),
+    };
+
+    fs.writeFileSync(filePath, JSON.stringify(specFile, null, 2), 'utf-8');
+    notifySpecChanged();
+
+    return {
+      success: true,
+      name: safeName,
+      displayName: displayName || safeName,
+      file: `${safeName}.json`,
+      filePath,
+      elementCount: specData.elements ? Object.keys(specData.elements).length : 0,
+      dataSchema: extractDataSchema(specData.elements),
+      message: `UI spec '${safeName}' 创建成功，前端重启后可见。`,
+    };
+  },
+  {
+    name: 'create_ui_spec',
+    description:
+      '动态创建新的 UI spec 组件。在 agent-backend/specs/ 目录下生成 .json 文件，前端实时加载渲染。\n' +
+      '创建前应先调用 get_ui_spec_rules 了解可用组件白名单。\n' +
+      '支持 actions 配置按钮点击行为（打开URL/发API请求），支持 initialState 设置表单默认值。\n' +
+      'jsonContent 格式: { "data": { "root": "根元素ID", "elements": {...} } }。如有交互，请通过 actions 和 initialState 参数传入。',
+    schema: z.object({
+      name: z.string().describe('spec 文件名（不含 .json 后缀），英文下划线命名，如 "user-profile"'),
+      displayName: z.string().describe('UI 展示名称，如 "用户资料"'),
+      description: z.string().describe('该 UI spec 的用途描述'),
+      jsonContent: z.string().describe(
+        'JSON 字符串，格式: { "data": { "root": "根元素ID", "elements": { "id": { "type": "组件名", "props": {...}, "children": [...] } } } }\n' +
+        '其中 type 必须为白名单内的组件名，children 为子元素 ID 数组。'
+      ),
+      actions: z.string().optional().describe(
+        'JSON 字符串，按钮点击行为配置。选填，但有 Button 时必须传！\n' +
+        '格式: { "submit": { "type": "url", "url": "https://www.baidu.com/s?wd={keyword}" } }\n' +
+        'url 类型：打开URL，支持 {fieldName} 替换表单字段值。fetch 类型：POST到 endpoint'
+      ),
+      initialState: z.string().optional().describe(
+        'JSON 字符串，表单初始值。选填，但有 Input 时必须传！\n' +
+        '格式: { "form": { "keyword": "", "searchType": "web" } }'
+      ),
+    }),
+  }
+);
