@@ -42,7 +42,7 @@ Git clone the repo, then tell any agent you already have running to boot it up i
 
 ### Install | Windows (✅)
 
-Download the latest `.exe` from [Releases](https://github.com/your-org/agent-ui/releases), double-click to install on Win10.
+Download the latest `.exe` from [Releases](https://github.com/GotJan/self-diy-agent/releases), double-click to install on Win10.
 
 Start chatting in the input box and let the Agent generate your first UI:
 
